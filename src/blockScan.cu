@@ -16,7 +16,6 @@ if (err != cudaSuccess) {\
 
 #define BLOCK_SIZE 1024
 
-
 static void compare_results(const int *vector1, const int *vector2,
 		int numElements) {
 	for (int i = 0; i < numElements; ++i) {
@@ -31,14 +30,14 @@ __host__
 void sequential_scan(int *g_idata, int *g_odata, int n) {
 
 	g_odata[0] = 0;
-	for(int i=1; i<n; i++){
-		g_odata[i] = g_odata[i-1] + g_idata[i-1];
+	for (int i = 1; i < n; i++) {
+		g_odata[i] = g_odata[i - 1] + g_idata[i - 1];
 	}
 }
 
 __global__
 void block_scan(int *g_idata, int *g_odata, int n) {
-	__shared__ int temp[BLOCK_SIZE*2];  // allocated on invocation
+	__shared__ int temp[BLOCK_SIZE * 2];  // allocated on invocation
 
 	int thid = threadIdx.x;
 	int offset = 1;
@@ -76,6 +75,128 @@ void block_scan(int *g_idata, int *g_odata, int n) {
 	__syncthreads();
 	g_odata[2 * thid] = temp[2 * thid]; // write results to device memory
 	g_odata[2 * thid + 1] = temp[2 * thid + 1];
+}
+
+__global__
+void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
+		int add_last) {
+	__shared__ int temp[BLOCK_SIZE * 2];  // allocated on invocation
+
+	int thid = threadIdx.x;
+	int blockId = blockDim.x * blockIdx.x * 2;
+	int offset = 1;
+	int last = 0;
+
+	temp[2 * thid] = g_idata[blockId + 2 * thid]; // load input into shared memory
+	temp[2 * thid + 1] = g_idata[blockId + 2 * thid + 1];
+
+	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
+	/*SUM[blockIdx.x] */
+		last = temp[2 * thid + 1];
+
+	for (int d = n >> 1; d > 0; d >>= 1)       // build sum in place up the tree
+			{
+		__syncthreads();
+		if (thid < d) {
+			int ai = offset * (2 * thid + 1) - 1;
+			int bi = offset * (2 * thid + 2) - 1;
+			temp[bi] += temp[ai];
+		}
+		offset *= 2;
+	}
+
+	if (thid == 0) {
+		temp[n - 1] = 0;
+	} // clear the last element
+
+	for (int d = 1; d < n; d *= 2) // traverse down tree & build scan
+			{
+		offset >>= 1;
+		__syncthreads();
+		if (thid < d) {
+			int ai = offset * (2 * thid + 1) - 1;
+			int bi = offset * (2 * thid + 2) - 1;
+			float t = temp[ai];
+			temp[ai] = temp[bi];
+			temp[bi] += t;
+		}
+	}
+
+	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
+		SUM[blockIdx.x] = temp[2 * thid + 1] + last;
+
+	__syncthreads();
+	g_idata[blockId + 2 * thid] = temp[2 * thid]; // write results to device memory
+	g_idata[blockId + 2 * thid + 1] = temp[2 * thid + 1];
+}
+
+__global__
+void add_to_block(int *block, int *SUM){
+	/*__shared__ */int s;
+
+	s = SUM[blockIdx.x];
+	int addr = blockIdx.x * blockDim.x * 2;
+}
+
+__host__
+void full_block_scan(int *h_IN, int *h_OUT, int len) {
+	int *d_IN = NULL;
+	err = cudaMalloc((void **) &d_IN, size);
+	CUDA_ERROR(err, "Failed to allocate device vector IN");
+
+	int *d_OUT = NULL;
+	err = cudaMalloc((void**) &d_OUT, size);
+	CUDA_ERROR(err, "Failed to allocate device vector OUT");
+
+	int *d_SUM = NULL;
+	err = cudaMalloc((void**) &d_SUM, BLOCK_SIZE >> 1);
+	CUDA_ERROR(err, "Failed to allocate device vector OUT");
+
+	// copy the memory from host to device
+	err = cudaMemcpy(d_IN, h_IN, size, cudaMemcpyHostToDevice);
+	CUDA_ERROR(err, "Failed to copy array IN from host to device");
+
+	int blocksPerGridLevel1 = 1 + ((len - 1) / (BLOCK_SIZE * 2));
+	int blocksPerGridLevel1 = 1 + ((len - 1) / (blocksPerGridLevel1 * 2));
+
+	cudaEventRecord(d_start, 0);
+	block_scan_full<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_IN, d_OUT, len,
+			d_SUM, 1);
+	block_scan_full<<<1, BLOCK_SIZE>>>(d_IN, d_OUT, len,
+				NULL, 0);
+	cudaEventRecord(d_stop, 0);
+	cudaEventSynchronize (d_stop);
+
+	cudaDeviceSynchronize();
+	err = cudaGetLastError();
+	CUDA_ERROR(err, "Failed to launch block scan kernel");
+
+	err = cudaEventElapsedTime(&d_msecs, d_start, d_stop);
+	CUDA_ERROR(err, "Failed to get elapsed time");
+
+	printf("Block scan with single thread of %d elements took = %.f5mSecs\n",
+			numElements, d_msecs);
+
+	err = cudaMemcpy(h_OUT, d_OUT, size, cudaMemcpyDeviceToHost);
+	CUDA_ERROR(err, "Failed to copy array OUT from device to host");
+
+	//// cleanup
+	// Free device global memory
+	err = cudaFree(d_IN);
+	CUDA_ERROR(err, "Failed to free device vector A");
+	err = cudaFree(d_OUT);
+	CUDA_ERROR(err, "Failed to free device vector B");
+
+	// Clean up the Host timer
+	sdkDeleteTimer (&timer);
+
+	// Clean up the Device timer event objects
+	cudaEventDestroy (d_start);
+	cudaEventDestroy(d_stop);
+
+	// Reset the device and exit
+	err = cudaDeviceReset();
+	CUDA_ERROR(err, "Failed to reset the device");
 }
 
 /**
@@ -120,9 +241,6 @@ int main(void) {
 	// sequential scan
 	sequential_scan(h_IN, h_OUT, numElements);
 
-
-
-
 	// ACtual algorithm
 
 	// allocate memory for the device
@@ -165,24 +283,21 @@ int main(void) {
 
 	compare_results(h_OUT, h_OUT_CUDA, numElements);
 
-
 	// Free host memory
-	free (h_IN);
-	free (h_OUT);
-	free (h_OUT_CUDA);
+	free(h_IN);
+	free(h_OUT);
+	free(h_OUT_CUDA);
 
 	// Clean up the Host timer
 	sdkDeleteTimer(&timer);
 
 	// Clean up the Device timer event objects
-	cudaEventDestroy (d_start);
-	cudaEventDestroy (d_stop);
+	cudaEventDestroy(d_start);
+	cudaEventDestroy(d_stop);
 
 	// Reset the device and exit
 	err = cudaDeviceReset();
 	CUDA_ERROR(err, "Failed to reset the device");
-
-
 
 	return 0;
 
