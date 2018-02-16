@@ -14,7 +14,10 @@ if (err != cudaSuccess) {\
 }\
 }
 
-static void compare_results(const float *vector1, const float *vector2,
+#define BLOCK_SIZE 1024
+
+
+static void compare_results(const int *vector1, const int *vector2,
 		int numElements) {
 	for (int i = 0; i < numElements; ++i) {
 		if (fabs(vector1[i] - vector2[i]) > 1e-5f) {
@@ -24,11 +27,22 @@ static void compare_results(const float *vector1, const float *vector2,
 	}
 }
 
+__host__
+void sequential_scan(int *g_idata, int *g_odata, int n) {
+
+	g_odata[0] = 0;
+	for(int i=1; i<n; i++){
+		g_odata[i] = g_odata[i-1] + g_idata[i-1];
+	}
+}
+
 __global__
-void block_scan(int *g_odata, int *g_idata, int n) {
-	extern __shared__ float temp[];  // allocated on invocation
+void block_scan(int *g_idata, int *g_odata, int n) {
+	__shared__ int temp[BLOCK_SIZE*2];  // allocated on invocation
+
 	int thid = threadIdx.x;
 	int offset = 1;
+
 	temp[2 * thid] = g_idata[2 * thid]; // load input into shared memory
 	temp[2 * thid + 1] = g_idata[2 * thid + 1];
 
@@ -84,12 +98,13 @@ int main(void) {
 	cudaEventCreate(&d_stop);
 
 	// size of the array to add
-	int numElements = 1024;
+	int numElements = 2048;
 	size_t size = numElements * sizeof(int);
 
 	// allocate the memory on the host for the arrays
 	int *h_IN = (int *) malloc(size);
 	int *h_OUT = (int *) malloc(size);
+	int *h_OUT_CUDA = (int *) malloc(size);
 
 	// verify the host allocations
 	if (h_IN == NULL || h_OUT == NULL) {
@@ -101,6 +116,12 @@ int main(void) {
 	for (int i = 0; i < numElements; i++) {
 		h_IN[i] = rand() % 10;
 	}
+
+	// sequential scan
+	sequential_scan(h_IN, h_OUT, numElements);
+
+
+
 
 	// ACtual algorithm
 
@@ -118,7 +139,7 @@ int main(void) {
 	CUDA_ERROR(err, "Failed to copy array IN from host to device");
 
 	cudaEventRecord(d_start, 0);
-	block_scan<<<1, 1024>>>(d_IN, d_OUT, numElements);
+	block_scan<<<1, BLOCK_SIZE>>>(d_IN, d_OUT, numElements);
 	cudaEventRecord(d_stop, 0);
 	cudaEventSynchronize(d_stop);
 
@@ -132,7 +153,7 @@ int main(void) {
 	printf("Block scan with single thread of %d elements took = %.f5mSecs\n",
 			numElements, d_msecs);
 
-	err = cudaMemcpy(h_OUT, d_OUT, size, cudaMemcpyDeviceToHost);
+	err = cudaMemcpy(h_OUT_CUDA, d_OUT, size, cudaMemcpyDeviceToHost);
 	CUDA_ERROR(err, "Failed to copy array OUT from device to host");
 
 	//// cleanup
@@ -142,9 +163,13 @@ int main(void) {
 	err = cudaFree(d_OUT);
 	CUDA_ERROR(err, "Failed to free device vector B");
 
+	compare_results(h_OUT, h_OUT_CUDA, numElements);
+
+
 	// Free host memory
 	free (h_IN);
 	free (h_OUT);
+	free (h_OUT_CUDA);
 
 	// Clean up the Host timer
 	sdkDeleteTimer(&timer);
@@ -156,6 +181,8 @@ int main(void) {
 	// Reset the device and exit
 	err = cudaDeviceReset();
 	CUDA_ERROR(err, "Failed to reset the device");
+
+
 
 	return 0;
 
