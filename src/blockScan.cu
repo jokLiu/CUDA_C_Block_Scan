@@ -19,6 +19,7 @@ if (err != cudaSuccess) {\
 static void compare_results(const int *vector1, const int *vector2,
 		int numElements) {
 	for (int i = 0; i < numElements; ++i) {
+//		printf("%d ----------- %d\n", vector1[i], vector2[i]);
 		if (fabs(vector1[i] - vector2[i]) > 1e-5f) {
 			fprintf(stderr, "Result verification failed at element %d!\n", i);
 			exit(EXIT_FAILURE);
@@ -94,7 +95,7 @@ void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 	/*SUM[blockIdx.x] */
 		last = temp[2 * thid + 1];
 
-	for (int d = n >> 1; d > 0; d >>= 1)       // build sum in place up the tree
+	for (int d = BLOCK_SIZE /*n >> 1*/; d > 0; d >>= 1)       // build sum in place up the tree
 			{
 		__syncthreads();
 		if (thid < d) {
@@ -106,10 +107,10 @@ void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 	}
 
 	if (thid == 0) {
-		temp[n - 1] = 0;
+		temp[BLOCK_SIZE * 2 - 1] = 0;
 	} // clear the last element
 
-	for (int d = 1; d < n; d *= 2) // traverse down tree & build scan
+	for (int d = 1; d < BLOCK_SIZE * 2; d *= 2) // traverse down tree & build scan
 			{
 		offset >>= 1;
 		__syncthreads();
@@ -125,8 +126,8 @@ void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 	__syncthreads();
 	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
 		SUM[blockIdx.x] = temp[2 * thid + 1] + last;
-	g_idata[blockId + 2 * thid] = temp[2 * thid]; // write results to device memory
-	g_idata[blockId + 2 * thid + 1] = temp[2 * thid + 1];
+	g_odata[blockId + 2 * thid] = temp[2 * thid]; // write results to device memory
+	g_odata[blockId + 2 * thid + 1] = temp[2 * thid + 1];
 }
 
 __global__
@@ -135,7 +136,7 @@ void add_to_block(int *block, int *SUM) {
 
 	// TODO check that last block is not used
 	s = SUM[blockIdx.x];
-	int addr = blockIdx.x * (blockDim.x << 1) + threadIdx.x + (blockDim.x << 1);
+	int addr = blockIdx.x * (blockDim.x << 1) + threadIdx.x /*+ (blockDim.x << 1)*/;
 
 	__syncthreads();
 
@@ -185,13 +186,15 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 	int blocksPerGridLevel1 = 1 + ((len - 1) / (BLOCK_SIZE * 2));
 	int blocksPerGridLevel2 = 1 + ((len - 1) / (blocksPerGridLevel1 * 2));
 
+	printf("\n%d\n\n",blocksPerGridLevel1);
+
 	cudaEventRecord(d_start, 0);
 	block_scan_full<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_IN, d_OUT, len,
 			d_SUM, 1);
 	block_scan_full<<<1, BLOCK_SIZE>>>(d_SUM, d_SUM_OUT, len,
 	NULL, 0);
-	// TODO check if we need that -1
-	add_to_block<<<blocksPerGridLevel1 - 1, BLOCK_SIZE>>>(d_OUT, d_SUM_OUT);
+//	 TODO check if we need that -1
+	add_to_block<<<blocksPerGridLevel1 , BLOCK_SIZE>>>(d_OUT, d_SUM_OUT);
 	cudaEventRecord(d_stop, 0);
 	cudaEventSynchronize(d_stop);
 
@@ -247,7 +250,7 @@ int main(void) {
 	cudaEventCreate(&d_stop);
 
 	// size of the array to add
-	int numElements = 2048;
+	int numElements = 4194304 ;
 	size_t size = numElements * sizeof(int);
 
 	// allocate the memory on the host for the arrays
@@ -263,7 +266,7 @@ int main(void) {
 
 	// initialise the host input to 1.0f
 	for (int i = 0; i < numElements; i++) {
-		h_IN[i] = rand() % 10;
+		h_IN[i] = 1; //rand() % 10;
 	}
 
 	// sequential scan
@@ -284,32 +287,39 @@ int main(void) {
 	err = cudaMemcpy(d_IN, h_IN, size, cudaMemcpyHostToDevice);
 	CUDA_ERROR(err, "Failed to copy array IN from host to device");
 
-	cudaEventRecord(d_start, 0);
-	block_scan<<<1, BLOCK_SIZE>>>(d_IN, d_OUT, numElements);
-	cudaEventRecord(d_stop, 0);
-	cudaEventSynchronize(d_stop);
+//	cudaEventRecord(d_start, 0);
+////	block_scan<<<1, BLOCK_SIZE>>>(d_IN, d_OUT, numElements);
+//	cudaEventRecord(d_stop, 0);
+//	cudaEventSynchronize(d_stop);
+//
+//	cudaDeviceSynchronize();
+//	err = cudaGetLastError();
+//	CUDA_ERROR(err, "Failed to launch block scan kernel");
+//
+//	err = cudaEventElapsedTime(&d_msecs, d_start, d_stop);
+//	CUDA_ERROR(err, "Failed to get elapsed time");
 
-	cudaDeviceSynchronize();
-	err = cudaGetLastError();
-	CUDA_ERROR(err, "Failed to launch block scan kernel");
+//	printf("Block scan with single thread of %d elements took = %.f5mSecs\n",
+//			numElements, d_msecs);
+//
+//	err = cudaMemcpy(h_OUT_CUDA, d_OUT, size, cudaMemcpyDeviceToHost);
+//	CUDA_ERROR(err, "Failed to copy array OUT from device to host");
+//
+//	//// cleanup
+//	// Free device global memory
+//	err = cudaFree(d_IN);
+//	CUDA_ERROR(err, "Failed to free device vector A");
+//	err = cudaFree(d_OUT);
+//	CUDA_ERROR(err, "Failed to free device vector B");
 
-	err = cudaEventElapsedTime(&d_msecs, d_start, d_stop);
-	CUDA_ERROR(err, "Failed to get elapsed time");
+//	compare_results(h_OUT, h_OUT_CUDA, numElements);
 
-	printf("Block scan with single thread of %d elements took = %.f5mSecs\n",
-			numElements, d_msecs);
 
-	err = cudaMemcpy(h_OUT_CUDA, d_OUT, size, cudaMemcpyDeviceToHost);
-	CUDA_ERROR(err, "Failed to copy array OUT from device to host");
 
-	//// cleanup
-	// Free device global memory
-	err = cudaFree(d_IN);
-	CUDA_ERROR(err, "Failed to free device vector A");
-	err = cudaFree(d_OUT);
-	CUDA_ERROR(err, "Failed to free device vector B");
+	full_block_scan(h_IN, h_OUT_CUDA, numElements);
 
 	compare_results(h_OUT, h_OUT_CUDA, numElements);
+
 
 	// Free host memory
 	free(h_IN);
@@ -326,6 +336,7 @@ int main(void) {
 	// Reset the device and exit
 	err = cudaDeviceReset();
 	CUDA_ERROR(err, "Failed to reset the device");
+
 
 	return 0;
 
