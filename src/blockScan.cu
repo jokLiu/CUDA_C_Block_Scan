@@ -15,7 +15,7 @@ if (err != cudaSuccess) {\
 }\
 }
 
-#define BLOCK_SIZE 128
+#define BLOCK_SIZE 1024
 
 // for avoiding bank conflicts
 #define NUM_BANKS 32
@@ -130,7 +130,7 @@ void block_scan_BCAO(int *g_idata, int *g_odata, int n) {
 __global__
 void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 		int add_last) {
-	__shared__ int temp[BLOCK_SIZE * 16];  // allocated on invocation
+	__shared__ int temp[BLOCK_SIZE * 4];  // allocated on invocation
 
 	int thid = threadIdx.x;
 	int blockId = blockDim.x * blockIdx.x * 2;
@@ -525,7 +525,7 @@ int main(void) {
 	cudaEventCreate(&d_stop);
 
 // size of the array to add
-	int numElements = 256*256*256;
+	int numElements = 10000000;
 	size_t size = numElements * sizeof(int);
 
 // allocate the memory on the host for the arrays
@@ -545,7 +545,11 @@ int main(void) {
 	}
 
 // sequential scan
+	sdkStartTimer(&timer);
 	sequential_scan(h_IN, h_OUT, numElements);
+	sdkStopTimer(&timer);
+	h_msecs = sdkGetTimerValue(&timer);printf("Sequential scan on host of %d elements took = %.f5mSecs\n",
+			numElements, h_msecs);
 
 // ACtual algorithm
 
