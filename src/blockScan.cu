@@ -5,6 +5,7 @@
 
 #include <helper_cuda.h>
 #include <helper_functions.h>
+#include <math.h>
 
 // A helper macro to simplify handling cuda error checking
 #define CUDA_ERROR( err, msg ) { \
@@ -14,12 +15,12 @@ if (err != cudaSuccess) {\
 }\
 }
 
-#define BLOCK_SIZE 1024
+#define BLOCK_SIZE 64
 
 static void compare_results(const int *vector1, const int *vector2,
 		int numElements) {
 	for (int i = 0; i < numElements; ++i) {
-//		printf("%d ----------- %d\n", vector1[i], vector2[i]);
+		printf("%d ----------- %d\n", vector1[i], vector2[i]);
 		if (fabs(vector1[i] - vector2[i]) > 1e-5f) {
 			fprintf(stderr, "Result verification failed at element %d!\n", i);
 			exit(EXIT_FAILURE);
@@ -95,7 +96,7 @@ void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 	/*SUM[blockIdx.x] */
 		last = temp[2 * thid + 1];
 
-	for (int d = BLOCK_SIZE /*n >> 1*/; d > 0; d >>= 1)       // build sum in place up the tree
+	for (int d = BLOCK_SIZE /*n >> 1*/; d > 0; d >>= 1) // build sum in place up the tree
 			{
 		__syncthreads();
 		if (thid < d) {
@@ -136,7 +137,8 @@ void add_to_block(int *block, int *SUM) {
 
 	// TODO check that last block is not used
 	s = SUM[blockIdx.x];
-	int addr = blockIdx.x * (blockDim.x << 1) + threadIdx.x /*+ (blockDim.x << 1)*/;
+	int addr = blockIdx.x * (blockDim.x << 1)
+			+ threadIdx.x /*+ (blockDim.x << 1)*/;
 
 	__syncthreads();
 
@@ -171,12 +173,20 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 	err = cudaMalloc((void**) &d_OUT, size);
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
-	int *d_SUM = NULL;
-	err = cudaMalloc((void**) &d_SUM, BLOCK_SIZE >> 1);
+	int *d_SUM_1 = NULL;
+	err = cudaMalloc((void**) &d_SUM_1, (int)ceil(len/(BLOCK_SIZE << 1)));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
-	int *d_SUM_OUT = NULL;
-	err = cudaMalloc((void**) &d_SUM_OUT, BLOCK_SIZE >> 1);
+	int *d_SUM_1_Scanned = NULL;
+	err = cudaMalloc((void**) &d_SUM_1_Scanned, (int)ceil(len/(BLOCK_SIZE << 1)));
+	CUDA_ERROR(err, "Failed to allocate device vector OUT");
+
+	int *d_SUM_2 = NULL;
+	err = cudaMalloc((void**) &d_SUM_2, BLOCK_SIZE << 1);
+	CUDA_ERROR(err, "Failed to allocate device vector OUT");
+
+	int *d_SUM_2_Scanned = NULL;
+	err = cudaMalloc((void**) &d_SUM_2_Scanned, BLOCK_SIZE << 1);
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	// copy the memory from host to device
@@ -184,17 +194,17 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 	CUDA_ERROR(err, "Failed to copy array IN from host to device");
 
 	int blocksPerGridLevel1 = 1 + ((len - 1) / (BLOCK_SIZE * 2));
-	int blocksPerGridLevel2 = 1 + ((len - 1) / (blocksPerGridLevel1 * 2));
+	int blocksPerGridLevel2 = ceil(blocksPerGridLevel1/(BLOCK_SIZE << 1));
 
-	printf("\n%d\n\n",blocksPerGridLevel1);
+	printf("\n%d\n\n", blocksPerGridLevel2);
 
 	cudaEventRecord(d_start, 0);
-	block_scan_full<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_IN, d_OUT, len,
-			d_SUM, 1);
-	block_scan_full<<<1, BLOCK_SIZE>>>(d_SUM, d_SUM_OUT, len,
-	NULL, 0);
+	block_scan_full<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_IN, d_OUT, len, d_SUM_1, 1);
+	block_scan_full<<<blocksPerGridLevel2, BLOCK_SIZE>>>(d_SUM_1, d_SUM_1_Scanned, blocksPerGridLevel2, d_SUM_2, 1);
+	block_scan_full<<<1, BLOCK_SIZE>>>(d_SUM_2, d_SUM_2_Scanned, BLOCK_SIZE << 1, NULL, 0);
 //	 TODO check if we need that -1
-	add_to_block<<<blocksPerGridLevel1 , BLOCK_SIZE>>>(d_OUT, d_SUM_OUT);
+	add_to_block<<<blocksPerGridLevel2, BLOCK_SIZE>>>(d_SUM_1_Scanned, d_SUM_2_Scanned);
+	add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT, d_SUM_1_Scanned);
 	cudaEventRecord(d_stop, 0);
 	cudaEventSynchronize(d_stop);
 
@@ -250,7 +260,7 @@ int main(void) {
 	cudaEventCreate(&d_stop);
 
 	// size of the array to add
-	int numElements = 4194304 ;
+	int numElements = 2097152;
 	size_t size = numElements * sizeof(int);
 
 	// allocate the memory on the host for the arrays
@@ -314,12 +324,9 @@ int main(void) {
 
 //	compare_results(h_OUT, h_OUT_CUDA, numElements);
 
-
-
 	full_block_scan(h_IN, h_OUT_CUDA, numElements);
 
 	compare_results(h_OUT, h_OUT_CUDA, numElements);
-
 
 	// Free host memory
 	free(h_IN);
@@ -336,7 +343,6 @@ int main(void) {
 	// Reset the device and exit
 	err = cudaDeviceReset();
 	CUDA_ERROR(err, "Failed to reset the device");
-
 
 	return 0;
 
