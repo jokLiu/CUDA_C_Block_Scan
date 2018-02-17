@@ -15,11 +15,11 @@ if (err != cudaSuccess) {\
 }\
 }
 
-#define BLOCK_SIZE 64
+#define BLOCK_SIZE 1024
 
 // for avoiding bank conflicts
-#define NUM_BANKS 16
-#define LOG_NUM_BANKS 4
+#define NUM_BANKS 32
+#define LOG_NUM_BANKS 5
 #ifdef ZERO_BANK_CONFLICTS
 #define CONFLICT_FREE_OFFSET(n) \
 		((n) >> NUM_BANKS + (n) >> (2 * LOG_NUM_BANKS))
@@ -30,8 +30,9 @@ if (err != cudaSuccess) {\
 static void compare_results(const int *vector1, const int *vector2,
 		int numElements) {
 	for (int i = 0; i < numElements; ++i) {
-		printf("%d ----------- %d\n", vector1[i], vector2[i]);
+//		printf("%d ----------- %d\n", vector1[i], vector2[i]);
 		if (fabs(vector1[i] - vector2[i]) > 1e-5f) {
+			printf("%d ----------- %d\n", vector1[i], vector2[i]);
 			fprintf(stderr, "Result verification failed at element %d!\n", i);
 			exit(EXIT_FAILURE);
 		}
@@ -49,7 +50,7 @@ void sequential_scan(int *g_idata, int *g_odata, int n) {
 
 __global__
 void block_scan_BCAO(int *g_idata, int *g_odata, int n) {
-	__shared__ int temp[BLOCK_SIZE * 2];  // allocated on invocation
+	__shared__ int temp[BLOCK_SIZE * 8];  // allocated on invocation
 
 	int thid = threadIdx.x;
 	int offset = 1;
@@ -58,7 +59,7 @@ void block_scan_BCAO(int *g_idata, int *g_odata, int n) {
 	int ai = thid;
 	int bi = thid + (n / 2);
 	int bankOffsetA = CONFLICT_FREE_OFFSET(ai);
-	int bankOffsetB = CONFLICT_FREE_OFFSET(ai);
+	int bankOffsetB = CONFLICT_FREE_OFFSET(bi);
 
 	temp[ai + bankOffsetA] = g_idata[ai];
 	temp[bi + bankOffsetB] = g_idata[bi];
@@ -81,8 +82,7 @@ void block_scan_BCAO(int *g_idata, int *g_odata, int n) {
 
 	// ADDED OUR MODIFIED
 	if (thid==0) temp[n-1 + CONFLICT_FREE_OFFSET(n-1)] = 0;
-	//if (thid==0) { temp[n – 1 + CONFLICT_FREE_OFFSET(n - 1)] = 0; }
-// ADDED OUR MODIFIED END
+	// ADDED OUR MODIFIED END
 
 	for (int d = 1; d < n; d *= 2) // traverse down tree & build scan
 			{
@@ -335,7 +335,7 @@ int main(void) {
 	cudaEventCreate(&d_stop);
 
 // size of the array to add
-	int numElements = 2097152;
+	int numElements = 2048;
 	size_t size = numElements * sizeof(int);
 
 // allocate the memory on the host for the arrays
@@ -372,36 +372,36 @@ int main(void) {
 	err = cudaMemcpy(d_IN, h_IN, size, cudaMemcpyHostToDevice);
 	CUDA_ERROR(err, "Failed to copy array IN from host to device");
 
-//	cudaEventRecord(d_start, 0);
-////	block_scan<<<1, BLOCK_SIZE>>>(d_IN, d_OUT, numElements);
-//	cudaEventRecord(d_stop, 0);
-//	cudaEventSynchronize(d_stop);
-//
-//	cudaDeviceSynchronize();
-//	err = cudaGetLastError();
-//	CUDA_ERROR(err, "Failed to launch block scan kernel");
-//
-//	err = cudaEventElapsedTime(&d_msecs, d_start, d_stop);
-//	CUDA_ERROR(err, "Failed to get elapsed time");
+	cudaEventRecord(d_start, 0);
+	block_scan_BCAO<<<1, BLOCK_SIZE>>>(d_IN, d_OUT, numElements);
+	cudaEventRecord(d_stop, 0);
+	cudaEventSynchronize(d_stop);
 
-//	printf("Block scan with single thread of %d elements took = %.f5mSecs\n",
-//			numElements, d_msecs);
-//
-//	err = cudaMemcpy(h_OUT_CUDA, d_OUT, size, cudaMemcpyDeviceToHost);
-//	CUDA_ERROR(err, "Failed to copy array OUT from device to host");
-//
-//	//// cleanup
-//	// Free device global memory
-//	err = cudaFree(d_IN);
-//	CUDA_ERROR(err, "Failed to free device vector A");
-//	err = cudaFree(d_OUT);
-//	CUDA_ERROR(err, "Failed to free device vector B");
+	cudaDeviceSynchronize();
+	err = cudaGetLastError();
+	CUDA_ERROR(err, "Failed to launch block scan kernel");
 
-//	compare_results(h_OUT, h_OUT_CUDA, numElements);
+	err = cudaEventElapsedTime(&d_msecs, d_start, d_stop);
+	CUDA_ERROR(err, "Failed to get elapsed time");
 
-	full_block_scan(h_IN, h_OUT_CUDA, numElements);
+	printf("Block scan with single thread of %d elements took = %.f5mSecs\n",
+			numElements, d_msecs);
+
+	err = cudaMemcpy(h_OUT_CUDA, d_OUT, size, cudaMemcpyDeviceToHost);
+	CUDA_ERROR(err, "Failed to copy array OUT from device to host");
+
+	//// cleanup
+	// Free device global memory
+	err = cudaFree(d_IN);
+	CUDA_ERROR(err, "Failed to free device vector A");
+	err = cudaFree(d_OUT);
+	CUDA_ERROR(err, "Failed to free device vector B");
 
 	compare_results(h_OUT, h_OUT_CUDA, numElements);
+//
+//	full_block_scan(h_IN, h_OUT_CUDA, numElements);
+//
+//	compare_results(h_OUT, h_OUT_CUDA, numElements);
 
 // Free host memory
 	free(h_IN);
