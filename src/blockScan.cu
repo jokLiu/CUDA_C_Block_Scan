@@ -15,17 +15,22 @@ if (err != cudaSuccess) {\
 }\
 }
 
-#define BLOCK_SIZE 1024
+#define BLOCK_SIZE 256
 
 // for avoiding bank conflicts
 #define NUM_BANKS 32
 #define LOG_NUM_BANKS 5
 #ifdef ZERO_BANK_CONFLICTS
 #define CONFLICT_FREE_OFFSET(n) \
-		((n) >> NUM_BANKS + (n) >> (2 * LOG_NUM_BANKS))
+		((n) >> NUM_BANKS + (n) >> (LOG_NUM_BANKS << 1))
 #else
 #define CONFLICT_FREE_OFFSET(n) ((n) >> LOG_NUM_BANKS)
 #endif
+
+
+__global__
+void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
+		int add_last);
 
 static void compare_results(const int *vector1, const int *vector2,
 		int numElements) {
@@ -48,7 +53,6 @@ void sequential_scan(int *g_idata, int *g_odata, int n) {
 	}
 }
 
-
 __global__
 void add_to_block(int *block, int *SUM) {
 	/*__shared__ */int s;
@@ -64,7 +68,6 @@ void add_to_block(int *block, int *SUM) {
 	block[addr + blockDim.x] += s; // TODO need to check properly
 
 }
-
 
 __global__
 void block_scan_BCAO(int *g_idata, int *g_odata, int n) {
@@ -128,71 +131,55 @@ void block_scan_BCAO(int *g_idata, int *g_odata, int n) {
 }
 
 __global__
-void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
-		int add_last) {
-	__shared__ int temp[BLOCK_SIZE * 4];  // allocated on invocation
+void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM, int add_last) {
+	__shared__ int temp[BLOCK_SIZE << 2];  // allocated on invocation
 
 	int thid = threadIdx.x;
-	int blockId = blockDim.x * blockIdx.x * 2;
-	int offset = 1;
+	int blockId = blockDim.x * blockIdx.x << 1;
+	int offset = 0;//1;
 	int last = 0;
 
-//	temp[2 * thid] = g_idata[blockId + 2 * thid]; // load input into shared memory
-//	temp[2 * thid + 1] = g_idata[blockId + 2 * thid + 1];
-
-	// ADDED OUR MODIFIED
 	int ai = thid;
 	int bi = thid + BLOCK_SIZE;  //(n / 2);
 	int bankOffsetA = CONFLICT_FREE_OFFSET(ai);
 	int bankOffsetB = CONFLICT_FREE_OFFSET(bi);
 
-	temp[ai + bankOffsetA] = g_idata[blockId + ai];
-	temp[bi + bankOffsetB] = g_idata[blockId + bi];
-//	 ADDED OUR MODIFIED END
+	if(blockId + ai < n)
+		temp[ai + bankOffsetA] = g_idata[blockId + ai];
+	if(blockId + bi < n)
+		temp[bi + bankOffsetB] = g_idata[blockId + bi];
+
 
 	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
-	/*SUM[blockIdx.x] */
-		last = temp[BLOCK_SIZE * 2 - 1 + CONFLICT_FREE_OFFSET(BLOCK_SIZE * 2 - 1)];
+		last = temp[(BLOCK_SIZE << 1) - 1
+				+ CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)];
 
-	for (int d = BLOCK_SIZE /*n >> 1*/; d > 0; d >>= 1) // build sum in place up the tree
+	for (int d = BLOCK_SIZE  /*n >> 1*/; d > 0; d >>= 1) // build sum in place up the tree
 			{
 		__syncthreads();
 		if (thid < d) {
-//			int ai = offset * (2 * thid + 1) - 1;
-//			int bi = offset * (2 * thid + 2) - 1;
-			// ADDED OUR MODIFIED
-			int ai = offset * (2 * thid + 1) - 1;
-			int bi = offset * (2 * thid + 2) - 1;
+			int ai = (((thid << 1) + 1) << offset) - 1;
+			int bi = (((thid << 1) + 2) << offset) - 1;
 			ai += CONFLICT_FREE_OFFSET(ai);
 			bi += CONFLICT_FREE_OFFSET(bi);
-			// ADDED OUR MODIFIED END
 			temp[bi] += temp[ai];
 		}
-		offset *= 2;
+		offset++;
 	}
 
-////	if (thid == 0) {
-////		temp[BLOCK_SIZE * 2 - 1] = 0;
-////	} // clear the last element
-//
-//	 ADDED OUR MODIFIED
-	if (thid == 0)
-		temp[BLOCK_SIZE * 2 - 1 + CONFLICT_FREE_OFFSET(BLOCK_SIZE * 2 - 1)] = 0;
-//	 ADDED OUR MODIFIED END
+	if (thid == 0){
+		temp[(BLOCK_SIZE << 1) - 1 + CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)] = 0;
+	}
 
-	for (int d = 1; d < BLOCK_SIZE * 2; d *= 2) // traverse down tree & build scan
+	for (int d = 1; d < (BLOCK_SIZE << 1); d <<= 1) // traverse down tree & build scan
 			{
-		offset >>= 1;
+		offset--;
 		__syncthreads();
 		if (thid < d) {
-//			int ai = offset * (2 * thid + 1) - 1;
-//			int bi = offset * (2 * thid + 2) - 1;
-			// ADDED OUR MODIFIED
-			int ai = offset * (2 * thid + 1) - 1;
-			int bi = offset * (2 * thid + 2) - 1;
+			int ai = (((thid << 1) + 1) << offset) - 1;
+			int bi = (((thid << 1) + 2) << offset) - 1;
 			ai += CONFLICT_FREE_OFFSET(ai);
 			bi += CONFLICT_FREE_OFFSET(bi);
-			// ADDED OUR MODIFIED END
 			int t = temp[ai];
 			temp[ai] = temp[bi];
 			temp[bi] += t;
@@ -201,16 +188,86 @@ void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 
 	__syncthreads();
 	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
-		SUM[blockIdx.x] = temp[BLOCK_SIZE * 2 - 1 + CONFLICT_FREE_OFFSET(BLOCK_SIZE * 2 - 1)] + last;
-//	g_odata[blockId + 2 * thid] = temp[2 * thid]; // write results to device memory
-//	g_odata[blockId + 2 * thid + 1] = temp[2 * thid + 1];
+		SUM[blockIdx.x] = temp[(BLOCK_SIZE << 1) - 1
+				+ CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1)  - 1)] + last;
 
-	// ADDED OUR MODIFIED
-	g_odata[blockId + ai] = temp[ai + bankOffsetA];
-	g_odata[blockId + bi] = temp[bi + bankOffsetB];
-	// ADDED OUR MODIFIED END
+	if(blockId + ai < n)
+		g_odata[blockId + ai] = temp[ai + bankOffsetA];
+	if(blockId + bi < n)
+		g_odata[blockId + bi] = temp[bi + bankOffsetB];
 }
 
+__global__
+void block_scan_full_BCAO_non_power_2(int *g_idata, int *g_odata, int n, int *SUM,
+		int add_last) {
+	__shared__ int temp[BLOCK_SIZE << 2];  // allocated on invocation
+
+	int thid = threadIdx.x;
+	int blockId = blockDim.x * blockIdx.x << 1;
+	int offset = 0;//1;
+	int last = 0;
+
+	int ai = thid;
+	int bi = thid + BLOCK_SIZE;  //(n / 2);
+	int bankOffsetA = CONFLICT_FREE_OFFSET(ai);
+	int bankOffsetB = CONFLICT_FREE_OFFSET(bi);
+
+	if(blockId + ai < n )
+		temp[ai + bankOffsetA] = g_idata[blockId + ai];
+	else
+		temp[ai + bankOffsetA] = 0;
+
+	if(blockId + bi < n )
+		temp[bi + bankOffsetB] = g_idata[blockId + bi];
+	else
+		temp[bi + bankOffsetB] = 0;
+
+	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
+		last = temp[(BLOCK_SIZE << 1) - 1
+				+ CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)];
+
+	for (int d = BLOCK_SIZE  /*n >> 1*/; d > 0; d >>= 1) // build sum in place up the tree
+			{
+		__syncthreads();
+		if (thid < d) {
+			int ai = (((thid << 1) + 1) << offset) - 1;
+			int bi = (((thid << 1) + 2) << offset) - 1;
+			ai += CONFLICT_FREE_OFFSET(ai);
+			bi += CONFLICT_FREE_OFFSET(bi);
+			temp[bi] += temp[ai];
+		}
+		offset++;
+	}
+
+	if (thid == 0){
+		temp[(BLOCK_SIZE << 1) - 1 + CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)] = 0;
+	}
+
+	for (int d = 1; d < (BLOCK_SIZE << 1); d <<= 1) // traverse down tree & build scan
+			{
+		offset--;
+		__syncthreads();
+		if (thid < d) {
+			int ai = (((thid << 1) + 1) << offset) - 1;
+			int bi = (((thid << 1) + 2) << offset) - 1;
+			ai += CONFLICT_FREE_OFFSET(ai);
+			bi += CONFLICT_FREE_OFFSET(bi);
+			int t = temp[ai];
+			temp[ai] = temp[bi];
+			temp[bi] += t;
+		}
+	}
+
+	__syncthreads();
+	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
+		SUM[blockIdx.x] = temp[(BLOCK_SIZE << 1) - 1
+				+ CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1)  - 1)] + last;
+
+	if(blockId + ai < n )
+		g_odata[blockId + ai] = temp[ai + bankOffsetA];
+	if(blockId + bi < n )
+		g_odata[blockId + bi] = temp[bi + bankOffsetB];
+}
 
 __host__
 void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
@@ -239,12 +296,14 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_1 = NULL;
-	err = cudaMalloc((void**) &d_SUM_1, (int) ceil(len / (BLOCK_SIZE << 1)));
+	err = cudaMalloc((void**) &d_SUM_1, 1 + ((len - 1) / (BLOCK_SIZE * 2))/*(int) ceil(len / (BLOCK_SIZE << 1))*/);
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
+
+	printf("\n%d\n\n", (int) ceil(len / (BLOCK_SIZE << 1)));
 
 	int *d_SUM_1_Scanned = NULL;
 	err = cudaMalloc((void**) &d_SUM_1_Scanned,
-			(int) ceil(len / (BLOCK_SIZE << 1)));
+			1 + ((len - 1) / (BLOCK_SIZE * 2))/*(int) ceil(len / (BLOCK_SIZE << 1))*/);
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_2 = NULL;
@@ -260,17 +319,27 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 	CUDA_ERROR(err, "Failed to copy array IN from host to device");
 
 	int blocksPerGridLevel1 = 1 + ((len - 1) / (BLOCK_SIZE * 2));
-	int blocksPerGridLevel2 = ceil(blocksPerGridLevel1 / (BLOCK_SIZE << 1));
+	int blocksPerGridLevel2 = 1+ceil(blocksPerGridLevel1 / (BLOCK_SIZE << 1));
 
+	printf("\n%d\n\n", blocksPerGridLevel1);
 	printf("\n%d\n\n", blocksPerGridLevel2);
 
 	cudaEventRecord(d_start, 0);
 	block_scan_full_BCAO<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_IN, d_OUT, len,
 			d_SUM_1, 1);
+//	cudaDeviceSynchronize();
+//	err = cudaMemcpy(h_OUT, d_OUT, 512*512*512, cudaMemcpyDeviceToHost);
+//		CUDA_ERROR(err, "Failed to copy array OUT from device to host");
+//		for(int i=0; i<512*512*512;i++)
+//			if(h_OUT[i] == 0){
+//				printf("%d ----\n", i);
+//				break;
+//			}
 	block_scan_full_BCAO<<<blocksPerGridLevel2, BLOCK_SIZE>>>(d_SUM_1,
-			d_SUM_1_Scanned, blocksPerGridLevel2, d_SUM_2, 1);
+			d_SUM_1_Scanned, blocksPerGridLevel1, d_SUM_2, 1);
 	block_scan_full_BCAO<<<1, BLOCK_SIZE>>>(d_SUM_2, d_SUM_2_Scanned,
-	BLOCK_SIZE << 1, NULL, 0);
+			blocksPerGridLevel2, NULL, 0);
+
 //	 TODO check if we need that -1
 	add_to_block<<<blocksPerGridLevel2, BLOCK_SIZE>>>(d_SUM_1_Scanned,
 			d_SUM_2_Scanned);
@@ -309,7 +378,6 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 	err = cudaDeviceReset();
 	CUDA_ERROR(err, "Failed to reset the device");
 }
-
 
 __global__
 void block_scan(int *g_idata, int *g_odata, int n) {
@@ -363,7 +431,7 @@ void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 	int offset = 1;
 	int last = 0;
 
-	temp[2 * thid] = g_idata[blockId + 2 * thid]; // load input into shared memory
+	temp[2 * thid] = g_idata[blockId + thid]; // load input into shared memory
 	temp[2 * thid + 1] = g_idata[blockId + 2 * thid + 1];
 
 	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
@@ -404,8 +472,6 @@ void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 	g_odata[blockId + 2 * thid] = temp[2 * thid]; // write results to device memory
 	g_odata[blockId + 2 * thid + 1] = temp[2 * thid + 1];
 }
-
-
 
 __host__
 void full_block_scan(int *h_IN, int *h_OUT, int len) {
@@ -525,7 +591,7 @@ int main(void) {
 	cudaEventCreate(&d_stop);
 
 // size of the array to add
-	int numElements = 10000000;
+	int numElements = 11111111;
 	size_t size = numElements * sizeof(int);
 
 // allocate the memory on the host for the arrays
@@ -548,7 +614,8 @@ int main(void) {
 	sdkStartTimer(&timer);
 	sequential_scan(h_IN, h_OUT, numElements);
 	sdkStopTimer(&timer);
-	h_msecs = sdkGetTimerValue(&timer);printf("Sequential scan on host of %d elements took = %.f5mSecs\n",
+	h_msecs = sdkGetTimerValue(&timer);
+	printf("Sequential scan on host of %d elements took = %.f5mSecs\n",
 			numElements, h_msecs);
 
 // ACtual algorithm
