@@ -73,7 +73,7 @@ void add_to_block(int *block, int *SUM) {
 __global__
 void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 		int add_last) {
-	__shared__ int temp[BLOCK_SIZE << 2];  // allocated on invocation
+	__shared__ int temp[(BLOCK_SIZE << 2) + (BLOCK_SIZE/8)];  // allocated on invocation
 
 	int thid = threadIdx.x;
 	int thid_shift = thid << 1;
