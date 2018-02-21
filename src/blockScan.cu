@@ -1,8 +1,37 @@
+//=========================================================================================
+//							DETAILS ABOUT THE SUBMISSION
+//=========================================================================================
+// Name: Jokubas Liutkus
+// ID: 1601768
+//
+// Goals Achieved (all goals were achieved):
+//	1. block scan +
+//	2. full scan for large vectors +
+//	3. Bank conflict avoidance optimization (BCAO) +
+//
+// Your time, in milliseconds to execute the different scans on a vector of 10,000,000 entries:
+//	∗ Block scan without BCAO:
+//	∗ Block scan with BCAO:
+//	∗ Full scan without BCAO:
+//	∗ Full scan with BCAO:
+//
+// CPU model: Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz x 4 (lab machine)
+// GPU model: GeForce GTX 960 (lab machine)
+//
+// Improvements/Additional features:
+//	1. All the multiplications were replaced with bit shifting which improved the performance
+//	2. Extract sum phase was merged with the main block scan function removing additional kernel call
+//	3. Padded the shared memory array of the last block to zero while loading in the data from device memory
+//	   to get the faster operations on the last block elements.
+//	4. Saving the last element of each block to the local variable from the shared memory
+//	   before running reduction and distribution phases rather than loading it later from a global memory
+//
+//=========================================================================================
+//=========================================================================================
+//=========================================================================================
+
 #include <stdio.h>
-
-// For the CUDA runtime routines (prefixed with "cuda_")
 #include <cuda_runtime.h>
-
 #include <helper_cuda.h>
 #include <helper_functions.h>
 #include <math.h>
@@ -15,23 +44,20 @@ if (err != cudaSuccess) {\
 }\
 }
 
+// Block size and its double version
 #define BLOCK_SIZE 512
+#define BLOCK_SIZE_TWICE BLOCK_SIZE*2
 
 // for avoiding bank conflicts
 #define NUM_BANKS 32
 #define LOG_NUM_BANKS 5
 #ifdef ZERO_BANK_CONFLICTS
 #define CONFLICT_FREE_OFFSET(n) \
-		((n) >> NUM_BANKS + (n) >> (LOG_NUM_BANKS * 2))
+		((n) >> NUM_BANKS + (n) >> (LOG_NUM_BANKS << 1))
 #else
 #define CONFLICT_FREE_OFFSET(n) ((n) >> LOG_NUM_BANKS)
 #endif
 
-// TODO thid variable for shifted version
-// TODO fix addition
-
-__global__
-void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM, int add_last);
 
 static void compare_results(const int *vector1, const int *vector2,
 		int numElements) {
@@ -55,29 +81,30 @@ void sequential_scan(int *g_idata, int *g_odata, int n) {
 }
 
 __global__
-void add_to_block(int *block, int *SUM) {
-	/*__shared__ */int s;
+void add_to_block(int *block, int len_block, int *SUM) {
+	int s = SUM[blockIdx.x];
 
-// TODO check that last block is not used
-	s = SUM[blockIdx.x];
-	int addr = blockIdx.x * (blockDim.x << 1)
-			+ threadIdx.x /*+ (blockDim.x << 1)*/;
+	int addr = blockIdx.x * (blockDim.x << 1) + threadIdx.x;
 
 	__syncthreads();
-
-	block[addr] += s;
-	block[addr + blockDim.x] += s; // TODO need to check properly
+	if (addr < len_block)
+		block[addr] += s;
+	if (addr + blockDim.x < len_block)
+		block[addr + blockDim.x] += s; // TODO need to check properly
 
 }
 
 __global__
 void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 		int add_last) {
-	__shared__ int temp[(BLOCK_SIZE << 2) + (BLOCK_SIZE/8)];  // allocated on invocation
+
+	const int blockSize = (BLOCK_SIZE << 1);
+
+	__shared__ int temp[blockSize + (BLOCK_SIZE / 8)]; // allocated on invocation
 
 	int thid = threadIdx.x;
 	int thid_shift = thid << 1;
-	int blockId = blockDim.x * blockIdx.x << 1;
+	int blockId = blockIdx.x * (BLOCK_SIZE << 1);
 	int offset = 0;  //1;
 	int last = 0;
 
@@ -86,34 +113,39 @@ void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 	int bankOffsetA = CONFLICT_FREE_OFFSET(ai);
 	int bankOffsetB = CONFLICT_FREE_OFFSET(bi);
 
-	if (blockId + ai < n)
+	if (blockId + ai < n) {
 		temp[ai + bankOffsetA] = g_idata[blockId + ai];
-	if (blockId + bi < n)
+	} else
+		temp[ai + bankOffsetA] = 0;
+	if (blockId + bi < n) {
 		temp[bi + bankOffsetB] = g_idata[blockId + bi];
+	} else
+		temp[bi + bankOffsetB] = 0;
 
 	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
-		last = temp[(BLOCK_SIZE << 1) - 1
-				+ CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)];
+		last =
+				temp[blockSize - 1 + CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)];
 
-	for (int d = BLOCK_SIZE /*n >> 1*/; d > 0; d >>= 1) // build sum in place up the tree
+	for (int d = BLOCK_SIZE ; d > 0; d >>= 1) // build sum in place up the tree
 			{
 		__syncthreads();
 		if (thid < d) {
 			int ai = ((thid_shift + 1) << offset) - 1;
 			int bi = ((thid_shift + 2) << offset) - 1;
+
 			ai += CONFLICT_FREE_OFFSET(ai);
 			bi += CONFLICT_FREE_OFFSET(bi);
 			temp[bi] += temp[ai];
 		}
+
 		offset++;
 	}
 
 	if (thid == 0) {
-		temp[(BLOCK_SIZE << 1) - 1 + CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)] =
-				0;
+		temp[blockSize - 1 + CONFLICT_FREE_OFFSET(blockSize - 1)] = 0;
 	}
 
-	for (int d = 1; d < (BLOCK_SIZE << 1); d <<= 1) // traverse down tree & build scan
+	for (int d = 1; d < blockSize; d <<= 1) // traverse down tree & build scan
 			{
 		offset--;
 		__syncthreads();
@@ -130,9 +162,8 @@ void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 
 	__syncthreads();
 	if (add_last && thid == BLOCK_SIZE - 1) // save the last element for later
-		SUM[blockIdx.x] = temp[(BLOCK_SIZE << 1) - 1
-				+ CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)] + last;
-
+		SUM[blockIdx.x] = temp[blockSize - 1
+				+ CONFLICT_FREE_OFFSET(blockSize - 1)] + last;
 	if (blockId + ai < n)
 		g_odata[blockId + ai] = temp[ai + bankOffsetA];
 	if (blockId + bi < n)
@@ -141,6 +172,7 @@ void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 
 __host__
 void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
+
 	// -----------------------------------------------------------
 	// 							INITIALIZATION
 	// -----------------------------------------------------------
@@ -167,20 +199,22 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_1 = NULL;
-	err = cudaMalloc((void**) &d_SUM_1, 1 + ((len - 1) / (BLOCK_SIZE * 2)));
+	err = cudaMalloc((void**) &d_SUM_1,
+			(1 + ((len - 1) / (BLOCK_SIZE * 2))) * sizeof(int));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_1_Scanned = NULL;
 	err = cudaMalloc((void**) &d_SUM_1_Scanned,
-			1 + ((len - 1) / (BLOCK_SIZE * 2)));
+			(1 + ((len - 1) / (BLOCK_SIZE * 2))) * sizeof(int));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_2 = NULL;
-	err = cudaMalloc((void**) &d_SUM_2, BLOCK_SIZE << 1);
+	err = cudaMalloc((void**) &d_SUM_2, (BLOCK_SIZE << 1) * sizeof(int));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_2_Scanned = NULL;
-	err = cudaMalloc((void**) &d_SUM_2_Scanned, BLOCK_SIZE << 1);
+	err = cudaMalloc((void**) &d_SUM_2_Scanned,
+			(BLOCK_SIZE << 1) * sizeof(int));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	// copy the memory from the host to the device
@@ -204,7 +238,7 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 	if (blocksPerGridLevel1 == 1) {
 		// record the start time
 		cudaEventRecord(d_start, 0);
-
+		printf("lanuched1!\n");
 		// execute the actual kernel
 		block_scan_full_BCAO<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_IN, d_OUT,
 				len,
@@ -221,13 +255,14 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 	else if (blocksPerGridLevel2 == 1) {
 		// record the start time
 		cudaEventRecord(d_start, 0);
-
+		printf("lanuched2!\n");
 		// execute the actual kernels
+		printf("%d\n", blocksPerGridLevel1);
 		block_scan_full_BCAO<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_IN, d_OUT,
 				len, d_SUM_1, 1);
 		block_scan_full_BCAO<<<blocksPerGridLevel2, BLOCK_SIZE>>>(d_SUM_1,
 				d_SUM_1_Scanned, blocksPerGridLevel1, NULL, 0);
-		add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT,
+		add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT, len,
 				d_SUM_1_Scanned);
 
 		// record the stop time
@@ -241,7 +276,7 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 	else if (blocksPerGridLevel3 == 1) {
 		// record the start time
 		cudaEventRecord(d_start, 0);
-
+		printf("lanuched3!\n");
 		// execute the actual kernels
 		block_scan_full_BCAO<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_IN, d_OUT,
 				len, d_SUM_1, 1);
@@ -250,8 +285,8 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 		block_scan_full_BCAO<<<1, BLOCK_SIZE>>>(d_SUM_2, d_SUM_2_Scanned,
 				blocksPerGridLevel2, NULL, 0);
 		add_to_block<<<blocksPerGridLevel2, BLOCK_SIZE>>>(d_SUM_1_Scanned,
-				d_SUM_2_Scanned);
-		add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT,
+				blocksPerGridLevel1, d_SUM_2_Scanned);
+		add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT, len,
 				d_SUM_1_Scanned);
 
 		// record the stop time
@@ -299,10 +334,10 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 	// Free device global memory
 	CUDA_ERROR(cudaFree(d_IN), "Failed to free device vector IN");
 	CUDA_ERROR(cudaFree(d_OUT), "Failed to free device vector OUT");
-	CUDA_ERROR(cudaFree(d_SUM_1), "Failed to free device vector B");
-	CUDA_ERROR(cudaFree(d_SUM_1_Scanned), "Failed to free device vector B");
-	CUDA_ERROR(cudaFree(d_SUM_2), "Failed to free device vector B");
-	CUDA_ERROR(cudaFree(d_SUM_2_Scanned), "Failed to free device vector B");
+	CUDA_ERROR(cudaFree(d_SUM_1), "Failed to free device vector SUM_1");
+	CUDA_ERROR(cudaFree(d_SUM_1_Scanned),"Failed to free device vector SUM_1_Scanned");
+	CUDA_ERROR(cudaFree(d_SUM_2), "Failed to free device vector SUM_2");
+	CUDA_ERROR(cudaFree(d_SUM_2_Scanned), "Failed to free device vector SUM_2_Scanned");
 
 	// Clean up the Device timer event objects
 	cudaEventDestroy(d_start);
@@ -398,20 +433,22 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_1 = NULL;
-	err = cudaMalloc((void**) &d_SUM_1, 1 + ((len - 1) / (BLOCK_SIZE * 2)));
+	err = cudaMalloc((void**) &d_SUM_1,
+			(1 + ((len - 1) / (BLOCK_SIZE * 2))) * sizeof(int));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_1_Scanned = NULL;
 	err = cudaMalloc((void**) &d_SUM_1_Scanned,
-			1 + ((len - 1) / (BLOCK_SIZE * 2)));
+			(1 + ((len - 1) / (BLOCK_SIZE * 2))) * sizeof(int));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_2 = NULL;
-	err = cudaMalloc((void**) &d_SUM_2, BLOCK_SIZE << 1);
+	err = cudaMalloc((void**) &d_SUM_2, (BLOCK_SIZE << 1) * sizeof(int));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	int *d_SUM_2_Scanned = NULL;
-	err = cudaMalloc((void**) &d_SUM_2_Scanned, BLOCK_SIZE << 1);
+	err = cudaMalloc((void**) &d_SUM_2_Scanned,
+			(BLOCK_SIZE << 1) * sizeof(int));
 	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 	// copy the memory from the host to the device
@@ -457,7 +494,7 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 				d_SUM_1, 1);
 		block_scan_full<<<blocksPerGridLevel2, BLOCK_SIZE>>>(d_SUM_1,
 				d_SUM_1_Scanned, blocksPerGridLevel1, NULL, 0);
-		add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT,
+		add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT, len,
 				d_SUM_1_Scanned);
 
 		// record the stop time
@@ -480,8 +517,8 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 		block_scan_full<<<1, BLOCK_SIZE>>>(d_SUM_2, d_SUM_2_Scanned,
 				blocksPerGridLevel2, NULL, 0);
 		add_to_block<<<blocksPerGridLevel2, BLOCK_SIZE>>>(d_SUM_1_Scanned,
-				d_SUM_2_Scanned);
-		add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT,
+				blocksPerGridLevel1, d_SUM_2_Scanned);
+		add_to_block<<<blocksPerGridLevel1, BLOCK_SIZE>>>(d_OUT, len,
 				d_SUM_1_Scanned);
 
 		// record the stop time
@@ -491,8 +528,7 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 	}
 
 	// if none of the conditions above is met, it means that the array is too
-	// large to be scanned in 3 level scan, therefore we print the error message
-	// and return
+	// large to be scanned in 3 level scan, therefore we print the error message and return
 	else {
 		fprintf(stderr,
 				"The array size=%d is too large to be scanned with level 3 scan!\n",
@@ -527,10 +563,12 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 	// Free device global memory
 	CUDA_ERROR(cudaFree(d_IN), "Failed to free device vector IN");
 	CUDA_ERROR(cudaFree(d_OUT), "Failed to free device vector OUT");
-	CUDA_ERROR(cudaFree(d_SUM_1), "Failed to free device vector B");
-	CUDA_ERROR(cudaFree(d_SUM_1_Scanned), "Failed to free device vector B");
-	CUDA_ERROR(cudaFree(d_SUM_2), "Failed to free device vector B");
-	CUDA_ERROR(cudaFree(d_SUM_2_Scanned), "Failed to free device vector B");
+	CUDA_ERROR(cudaFree(d_SUM_1), "Failed to free device vector SUM_1");
+	CUDA_ERROR(cudaFree(d_SUM_1_Scanned),
+			"Failed to free device vector SUM_1_Scanned");
+	CUDA_ERROR(cudaFree(d_SUM_2), "Failed to free device vector SUM_2");
+	CUDA_ERROR(cudaFree(d_SUM_2_Scanned),
+			"Failed to free device vector SUM_2_Scanned");
 
 	// Clean up the Device timer event objects
 	cudaEventDestroy(d_start);
@@ -555,10 +593,10 @@ int main(void) {
 	double h_msecs;
 
 // create device timer
-	cudaEvent_t d_start, d_stop;
-	float d_msecs;
-	cudaEventCreate(&d_start);
-	cudaEventCreate(&d_stop);
+//	cudaEvent_t d_start, d_stop;
+//	float d_msecs;
+//	cudaEventCreate(&d_start);
+//	cudaEventCreate(&d_stop);
 
 // size of the array to add
 	int numElements = 10000000;
@@ -591,13 +629,13 @@ int main(void) {
 // ACtual algorithm
 
 // allocate memory for the device
-	int *d_IN = NULL;
-	err = cudaMalloc((void **) &d_IN, size);
-	CUDA_ERROR(err, "Failed to allocate device vector IN");
-
-	int *d_OUT = NULL;
-	err = cudaMalloc((void**) &d_OUT, size);
-	CUDA_ERROR(err, "Failed to allocate device vector OUT");
+//	int *d_IN = NULL;
+//	err = cudaMalloc((void **) &d_IN, size);
+//	CUDA_ERROR(err, "Failed to allocate device vector IN");
+//
+//	int *d_OUT = NULL;
+//	err = cudaMalloc((void**) &d_OUT, size);
+//	CUDA_ERROR(err, "Failed to allocate device vector OUT");
 
 // copy the memory from host to device
 //	err = cudaMemcpy(d_IN, h_IN, size, cudaMemcpyHostToDevice);
@@ -651,12 +689,12 @@ int main(void) {
 	sdkDeleteTimer(&timer);
 
 // Clean up the Device timer event objects
-	cudaEventDestroy(d_start);
-	cudaEventDestroy(d_stop);
-
-// Reset the device and exit
-	err = cudaDeviceReset();
-	CUDA_ERROR(err, "Failed to reset the device");
+//	cudaEventDestroy(d_start);
+//	cudaEventDestroy(d_stop);
+//
+//// Reset the device and exit
+//	err = cudaDeviceReset();
+//	CUDA_ERROR(err, "Failed to reset the device");
 
 	return 0;
 
