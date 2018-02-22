@@ -10,10 +10,10 @@
 //	3. Bank conflict avoidance optimization (BCAO) +
 //
 // Your time, in milliseconds to execute the different scans on a vector of 10,000,000 entries:
-//	∗ Block scan without BCAO: 35ms
-//	∗ Block scan with BCAO: 25ms
-//	∗ Full scan without BCAO: 45ms
-//	∗ Full scan with BCAO: 35ms
+//	∗ Block scan without BCAO: 3.05472ms
+//	∗ Block scan with BCAO: 2.02445ms
+//	∗ Full scan without BCAO: 4.01370ms
+//	∗ Full scan with BCAO: 2.98333ms
 //
 // CPU model: Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz x 4 (lab machine)
 // GPU model: GeForce GTX 960 (lab machine)
@@ -31,6 +31,7 @@
 //=========================================================================================
 //=========================================================================================
 //=========================================================================================
+
 
 #include <stdio.h>
 #include <cuda_runtime.h>
@@ -79,7 +80,6 @@ void sequential_scan(int *g_idata, int *g_odata, int n) {
 		g_odata[i] = g_odata[i - 1] + g_idata[i - 1];
 	}
 }
-
 
 // -----------------------------------------------------------
 // 					ADITTION OPERATION FOR
@@ -139,8 +139,7 @@ void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 				+ CONFLICT_FREE_OFFSET((BLOCK_SIZE << 1) - 1)];
 
 	// build sum in place up the tree (reduction phase)
-	for (int d = BLOCK_SIZE; d > 0; d >>= 1)
-			{
+	for (int d = BLOCK_SIZE; d > 0; d >>= 1) {
 		__syncthreads();
 		if (thid < d) {
 			int ai = ((thid_shift + 1) << offset) - 1;
@@ -161,8 +160,7 @@ void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 	}
 
 	// traverse down tree & build scan (distribution phase)
-	for (int d = 1; d < BLOCK_SIZE_TWICE; d <<= 1)
-			{
+	for (int d = 1; d < BLOCK_SIZE_TWICE; d <<= 1) {
 		offset--;
 		__syncthreads();
 		if (thid < d) {
@@ -336,7 +334,7 @@ void full_block_scan_BCAO(int *h_IN, int *h_OUT, int len) {
 
 	// print the time elapsed
 	printf(
-			"Full block with bank avoidance scan with %d elements took = %.f5mSecs\n",
+			"Full block with bank avoidance scan with %d elements took = %.5fmSecs\n",
 			len, d_msecs);
 
 	// copy the result from the device back to the host
@@ -391,8 +389,7 @@ void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 		last = temp[(thid << 1) + 1];
 
 	// build sum in place up the tree (reduction phase)
-	for (int d = BLOCK_SIZE ; d > 0; d >>= 1)
-			{
+	for (int d = BLOCK_SIZE; d > 0; d >>= 1) {
 		__syncthreads();
 		if (thid < d) {
 			int ai = (((thid << 1) + 1) << offset) - 1;
@@ -407,8 +404,7 @@ void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 		temp[(BLOCK_SIZE << 1) - 1] = 0;
 
 	// traverse down tree & build scan (distribution phase)
-	for (int d = 1; d < (BLOCK_SIZE << 1); d <<= 1)
-			{
+	for (int d = 1; d < (BLOCK_SIZE << 1); d <<= 1) {
 		offset--;
 		__syncthreads();
 		if (thid < d) {
@@ -577,7 +573,7 @@ void full_block_scan(int *h_IN, int *h_OUT, int len) {
 	CUDA_ERROR(err, "Failed to get elapsed time");
 
 	// print the time elapsed
-	printf("Full block scan with %d elements took = %.f5mSecs\n", len, d_msecs);
+	printf("Full block scan with %d elements took = %.5fmSecs\n", len, d_msecs);
 
 	// copy the result from the device back to the host
 	err = cudaMemcpy(h_OUT, d_OUT, size, cudaMemcpyDeviceToHost);
@@ -645,7 +641,7 @@ int main(void) {
 	sequential_scan(h_IN, h_OUT, numElements);
 	sdkStopTimer(&timer);
 	h_msecs = sdkGetTimerValue(&timer);
-	printf("Sequential scan on host of %d elements took = %.f5mSecs\n",
+	printf("Sequential scan on host of %d elements took = %.5fmSecs\n",
 			numElements, h_msecs);
 
 	// -----------------------------------------------------------
@@ -710,7 +706,7 @@ int main(void) {
 	CUDA_ERROR(err, "Failed to get elapsed time");
 
 	// print the time elapsed
-	printf("Block with bank avoidance scan %d elements took = %.f5mSecs\n",
+	printf("Block with bank avoidance scan %d elements took = %.5fmSecs\n",
 			numElements, d_msecs);
 
 	// -----------------------------------------------------------
@@ -738,7 +734,7 @@ int main(void) {
 	CUDA_ERROR(err, "Failed to get elapsed time");
 
 	// print the time elapsed
-	printf("Block scan %d elements took = %.f5mSecs\n", numElements, d_msecs);
+	printf("Block scan %d elements took = %.5fmSecs\n", numElements, d_msecs);
 
 	// Free device global memory
 	CUDA_ERROR(cudaFree(d_IN), "Failed to free device vector IN");
