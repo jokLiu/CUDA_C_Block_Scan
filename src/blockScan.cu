@@ -10,10 +10,10 @@
 //	3. Bank conflict avoidance optimization (BCAO) +
 //
 // Your time, in milliseconds to execute the different scans on a vector of 10,000,000 entries:
-//	∗ Block scan without BCAO: 3.05472ms
-//	∗ Block scan with BCAO: 2.02445ms
-//	∗ Full scan without BCAO: 4.01370ms
-//	∗ Full scan with BCAO: 2.98333ms
+//	∗ Block scan without BCAO: 2.25990ms
+//	∗ Block scan with BCAO: 1.37642ms
+//	∗ Full scan without BCAO: 3.23677ms
+//	∗ Full scan with BCAO: 2.35392ms
 //
 // CPU model: Intel(R) Core(TM) i5-6500 CPU @ 3.20GHz x 4 (lab machine)
 // GPU model: GeForce GTX 960 (lab machine)
@@ -22,12 +22,12 @@
 //	1. All the multiplications were replaced with bit shifting which improved the performance
 //	2. Extract sum phase was merged with the main block scan function removing additional kernel call
 //	3. Padded the shared memory array of the last block to zero while loading in the data from device memory
-//	   to get the faster operations on the last block elements.
+//	   to get the faster operations on the last block elements as described in the paper.
 //	4. Saving the last element of each block to the local variable from the shared memory
 //	   before running reduction and distribution phases rather than loading it later from a global memory
 //	5. Double block scan implemented which doubles the number of elements scanned by each block.
 //	6. Offset variable was changed from doubling each time to addition to enable the shifting of elements
-// 		in the reduction and distribution phases.
+// 	   in the reduction and distribution phases.
 //=========================================================================================
 //=========================================================================================
 //=========================================================================================
@@ -48,7 +48,8 @@ if (err != cudaSuccess) {\
 }
 
 // Block size and its double version
-#define BLOCK_SIZE 1024
+// version with 128 block size showed the best performance
+#define BLOCK_SIZE 128
 #define BLOCK_SIZE_TWICE BLOCK_SIZE*2
 
 // for avoiding bank conflicts
@@ -61,10 +62,11 @@ if (err != cudaSuccess) {\
 #define CONFLICT_FREE_OFFSET(n) ((n) >> LOG_NUM_BANKS)
 #endif
 
+// for comparing the results with the host version
 static void compare_results(const int *vector1, const int *vector2,
 		int numElements) {
 	for (int i = 0; i < numElements; ++i) {
-		if (fabs(vector1[i] - vector2[i]) > 1e-5f) {
+		if (fabs(vector1[i] != vector2[i]) ) {
 			printf("%d ----------- %d\n", vector1[i], vector2[i]);
 			fprintf(stderr, "Result verification failed at element %d!\n", i);
 			exit(EXIT_FAILURE);
@@ -72,6 +74,7 @@ static void compare_results(const int *vector1, const int *vector2,
 	}
 }
 
+// sequential scan version for speed and correctness comparison
 __host__
 void sequential_scan(int *g_idata, int *g_odata, int n) {
 
@@ -87,8 +90,10 @@ void sequential_scan(int *g_idata, int *g_odata, int n) {
 // -----------------------------------------------------------
 __global__
 void add_to_block(int *block, int len_block, int *SUM) {
-	// get the value of the elemenet that has to be
-	// added to the main vector
+	// get the value of the element that has to be
+	// added to the main vector. We do not need to worry
+	// about accessing out of bounds because this function
+	// is called with the same number of blocks as the size of SUM array.
 	int s = SUM[blockIdx.x];
 
 	// get the address the vector that has to be updated
@@ -107,8 +112,10 @@ void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 		int add_last) {
 
 	// shared memory initialised to contain more than
-	// twice memory due to the offset
-	__shared__ int temp[BLOCK_SIZE_TWICE + (BLOCK_SIZE / 8)];
+	// twice memory due to the offset because it might
+	// go out of bounds of the double array and the segfault
+	// would be received
+	__shared__ int temp[BLOCK_SIZE_TWICE + (BLOCK_SIZE >> 4)];
 
 	// local variables for the later usage to improve the performance
 	int thid = threadIdx.x;
@@ -149,7 +156,6 @@ void block_scan_full_BCAO(int *g_idata, int *g_odata, int n, int *SUM,
 			bi += CONFLICT_FREE_OFFSET(bi);
 			temp[bi] += temp[ai];
 		}
-
 		offset++;
 	}
 
@@ -370,7 +376,7 @@ __global__
 void block_scan_full(int *g_idata, int *g_odata, int n, int *SUM,
 		int add_last) {
 	// shared memory init
-	__shared__ int temp[BLOCK_SIZE << 1];  // allocated on invocation
+	__shared__ int temp[BLOCK_SIZE << 1];
 
 	// local variables for the later usage to improve the performance
 	int thid = threadIdx.x;
@@ -657,7 +663,7 @@ int main(void) {
 	compare_results(h_OUT, h_OUT_CUDA, numElements);
 
 	// -----------------------------------------------------------
-	// 					SIMPLE BLOCK SCAN
+	// 					SIMPLE BLOCK SCANS
 	// -----------------------------------------------------------
 	// create device timer
 	cudaEvent_t d_start, d_stop;
