@@ -55,12 +55,8 @@ if (err != cudaSuccess) {\
 // for avoiding bank conflicts
 #define NUM_BANKS 32
 #define LOG_NUM_BANKS 5
-#ifdef ZERO_BANK_CONFLICTS
-#define CONFLICT_FREE_OFFSET(n) \
-		((n) >> NUM_BANKS + (n) >> (LOG_NUM_BANKS << 1))
-#else
-#define CONFLICT_FREE_OFFSET(n) ((n) >> LOG_NUM_BANKS)
-#endif
+
+#define CONFLICT_FREE_OFFSET(n)  (((n) >> LOG_NUM_BANKS) + ((n) >> (2 * LOG_NUM_BANKS)))
 
 // for comparing the results with the host version
 static void compare_results(const int *vector1, const int *vector2,
